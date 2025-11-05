@@ -7,7 +7,7 @@ import com.rafaelcosta.modelo_app_crud_usuario_api.data.local.dao.UsuarioDao
 import com.rafaelcosta.modelo_app_crud_usuario_api.data.local.entity.UsuarioEntity
 
 
-@Database(entities = [UsuarioEntity::class], version = 4)
+@Database(entities = [UsuarioEntity::class], version = 5)
 @TypeConverters(Converters::class)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun usuarioDao(): UsuarioDao

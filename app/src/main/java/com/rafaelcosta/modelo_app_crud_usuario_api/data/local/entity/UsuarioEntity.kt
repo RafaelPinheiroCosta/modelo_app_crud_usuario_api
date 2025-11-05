@@ -16,5 +16,6 @@ data class UsuarioEntity(
     val updatedAt: Long,
     val pendingSync: Boolean,
     val localOnly: Boolean = false,
-    val operationType: String? = null
+    val operationType: String? = null,
+    val deleted: Boolean = false
 )

@@ -9,6 +9,7 @@ import com.rafaelcosta.modelo_app_crud_usuario_api.data.repository.UsuarioReposi
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 
+
 @HiltWorker
 class UsuarioSyncWorker @AssistedInject constructor(
     @Assisted context: Context,
@@ -25,8 +26,9 @@ class UsuarioSyncWorker @AssistedInject constructor(
             Result.success()
         } catch (e: Exception) {
             android.util.Log.e("UsuarioSyncWorker", "Erro na sincronização", e)
-            Toast.makeText(applicationContext, "Erro na sincronização.", Toast.LENGTH_SHORT).show()
             Result.retry()
         }
+
     }
+
 }

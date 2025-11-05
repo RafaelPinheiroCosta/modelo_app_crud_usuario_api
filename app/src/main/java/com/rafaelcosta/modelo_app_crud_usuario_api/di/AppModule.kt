@@ -29,7 +29,7 @@ object AppModule {
     @Provides
     @Singleton
     @Named("baseUrl")
-    fun provideBaseUrl(): String = "http://10.83.131.30:8080/"
+    fun provideBaseUrl(): String = "http://10.0.2.2:8080/"
 
     @Provides
     @Singleton

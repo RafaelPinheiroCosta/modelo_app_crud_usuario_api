@@ -10,6 +10,7 @@ import com.rafaelcosta.modelo_app_crud_usuario_api.data.local.entity.UsuarioEnti
 import com.rafaelcosta.modelo_app_crud_usuario_api.data.mapper.toDomain
 import com.rafaelcosta.modelo_app_crud_usuario_api.data.mapper.toEntity
 import com.rafaelcosta.modelo_app_crud_usuario_api.data.remote.UsuarioApi
+import com.rafaelcosta.modelo_app_crud_usuario_api.data.worker.UsuarioSyncScheduler
 import com.rafaelcosta.modelo_app_crud_usuario_api.di.IoDispatcher
 import com.rafaelcosta.modelo_app_crud_usuario_api.domain.model.Usuario
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -70,15 +71,16 @@ class UsuarioRepository @Inject constructor(
 
         val merged = remote.map { dto ->
             val old = current[dto.id]
-            dto.toEntity(pending = false, oldLocalPath = old?.fotoLocalPath)
+            if (old?.deleted == true) old else dto.toEntity(pending = false, oldLocalPath = old?.fotoLocalPath)
         }
 
         dao.upsertAll(merged)
 
         val remoteIds = merged.map { it.id }.toSet()
-        val toDelete = current.keys.filter { it !in remoteIds }
-        toDelete.forEach { dao.deleteById(it) }
+        val toDelete = current.values.filter { it.id !in remoteIds && !it.pendingSync && !it.localOnly }
+        toDelete.forEach { dao.deleteById(it.id) }
     }
+
 
     suspend fun create(
         nome: String,
@@ -102,27 +104,16 @@ class UsuarioRepository @Inject constructor(
                 anexos = anexosUris?.map { it.toString() },
                 updatedAt = System.currentTimeMillis(),
                 pendingSync = true,
-                localOnly = true
+                localOnly = true,
+                deleted = false,
+                operationType = "CREATE"
             )
 
             dao.upsert(localUsuario)
 
-            runCatching {
-                val dados = mapOf("nome" to nome, "email" to email, "cpf" to cpf, "senha" to senha)
+            UsuarioSyncScheduler.enqueueNow(context)
 
-                val resp = api.create(
-                    dadosJson = partJsonDados(dados),
-                    foto = partFromUri("foto", fotoUri),
-                    anexos = partsFromUris(anexosUris)
-                )
-
-                dao.deleteById(tempId)
-                dao.upsert(resp.toEntity(pending = false))
-
-                resp.toDomain()
-            }.getOrElse {
-                localUsuario.toDomain()
-            }
+            localUsuario.toDomain()
         }
     }
 
@@ -146,96 +137,87 @@ class UsuarioRepository @Inject constructor(
                 fotoLocalPath = fotoUri?.let { saveLocalCopy(it) } ?: local.fotoLocalPath,
                 anexos = anexosUris?.map { it.toString() } ?: local.anexos,
                 updatedAt = System.currentTimeMillis(),
-                pendingSync = true
+                pendingSync = true,
+                localOnly = local.localOnly,
+                deleted = false,
+                operationType = "UPDATE"
             )
 
             dao.upsert(updated)
-
-            runCatching {
-                val dados = buildMap<String, Any> {
-                    put("nome", nome)
-                    put("email", email)
-                    put("cpf", cpf)
-                    senha?.takeIf { it.isNotBlank() }?.let { put("senha", it) }
-                }
-
-                val resp = api.update(
-                    id = id,
-                    dadosJson = partJsonDados(dados),
-                    foto = partFromUri("foto", fotoUri),
-                    anexos = partsFromUris(anexosUris)
-                )
-
-                dao.upsert(resp.toEntity(pending = false))
-                resp.toDomain()
-            }.getOrElse {
-                updated.toDomain()
-            }
+            UsuarioSyncScheduler.enqueueNow(context)
+            updated.toDomain()
         }
     }
 
 
     suspend fun delete(id: String): Result<Unit> = runCatching {
-        val local = dao.getById(id)
-        if (local != null) {
-
-            dao.upsert(local.copy(pendingSync = true))
-        }
-
-        runCatching { api.delete(id) }
-            .onSuccess {
-
-                dao.deleteById(id)
-            }
-            .onFailure {
-
-            }
+        val local = dao.getById(id) ?: return@runCatching
+        dao.upsert(
+            local.copy(
+                deleted = true,
+                pendingSync = true,
+                updatedAt = System.currentTimeMillis(),
+                operationType = "DELETE"
+            )
+        )
+        UsuarioSyncScheduler.enqueueNow(context)
     }
 
     suspend fun sincronizarUsuarios() {
         val pendentes = dao.getPendingSync()
 
+        pendentes.filter { it.operationType == "DELETE" }.forEach { u ->
+            try {
+                runCatching { api.delete(u.id) }
+                dao.deleteById(u.id)
+            } catch (e: Exception) {
+            }
+        }
 
-        for (usuario in pendentes) {
+        pendentes.filter { it.operationType == "CREATE" && !it.deleted }.forEach { u ->
+            try {
+                val dados = mapOf("nome" to u.nome, "email" to u.email, "cpf" to u.cpf, "senha" to u.senha)
+                val resp = api.create(
+                    dadosJson = partJsonDados(dados),
+                    foto = partFromUri("foto", u.fotoPerfilUrl?.toUri()),
+                    anexos = partsFromUris(u.anexos?.mapNotNull { it.toUri() })
+                )
+                dao.deleteById(u.id)
+                dao.upsert(resp.toEntity(pending = false, oldLocalPath = u.fotoLocalPath))
+            } catch (_: Exception) {
+            }
+        }
+
+        pendentes.filter { it.operationType == "UPDATE" && !it.deleted }.forEach { u ->
             try {
                 val dados = buildMap<String, Any> {
-                    put("nome", usuario.nome)
-                    put("email", usuario.email)
-                    put("cpf", usuario.cpf)
-                    usuario.senha?.takeIf { it.isNotBlank() }?.let { put("senha", it) }
+                    put("nome", u.nome)
+                    put("email", u.email)
+                    put("cpf", u.cpf)
+                    u.senha?.takeIf { it.isNotBlank() }?.let { put("senha", it) }
                 }
 
-                val fotoUri = usuario.fotoPerfilUrl?.toUri()
-                val anexosUris = usuario.anexos?.mapNotNull { runCatching { it.toUri() }.getOrNull() }
+                val resp = api.update(
+                    id = u.id,
+                    dadosJson = partJsonDados(dados),
+                    foto = partFromUri("foto", u.fotoPerfilUrl?.toUri()),
+                    anexos = partsFromUris(u.anexos?.mapNotNull { it.toUri() })
+                )
 
-                when (usuario.operationType) {
-                    "UPDATE" -> {
-                        val resp = api.update(
-                            id = usuario.id,
-                            dadosJson = partJsonDados(dados),
-                            foto = partFromUri("foto", fotoUri),
-                            anexos = partsFromUris(anexosUris)
-                        )
-                        dao.upsert(resp.toEntity(pending = false, oldLocalPath = usuario.fotoLocalPath))
-                    }
+                dao.upsert(
+                    resp.toEntity(
+                        pending = false,
+                        oldLocalPath = u.fotoLocalPath
+                    ).copy(
+                        updatedAt = System.currentTimeMillis(),
+                        pendingSync = false,
+                        localOnly = false,
+                        operationType = null
+                    )
+                )
 
-                    "DELETE" -> {
-                        api.delete(usuario.id)
-                        dao.deleteById(usuario.id)
-                    }
-
-                    else -> {
-                        val resp = api.create(
-                            dadosJson = partJsonDados(dados),
-                            foto = partFromUri("foto", fotoUri),
-                            anexos = partsFromUris(anexosUris)
-                        )
-                        dao.deleteById(usuario.id)
-                        dao.upsert(resp.toEntity(pending = false, oldLocalPath = usuario.fotoLocalPath))
-                    }
-                }
             } catch (e: Exception) {
-                android.util.Log.w("UsuarioRepository", "Erro ao sincronizar pendente ${usuario.id}: ${e.message}")
+                android.util.Log.w("UsuarioRepository", "Falha ao sincronizar UPDATE ${u.id}: ${e.message}")
             }
         }
 
@@ -245,26 +227,34 @@ class UsuarioRepository @Inject constructor(
 
             val remotos = listaApi.map { dto ->
                 val antigo = atuais[dto.id]
-                dto.toEntity(pending = false, oldLocalPath = antigo?.fotoLocalPath)
+
+                // 1️⃣ se foi deletado localmente, não ressuscita
+                if (antigo?.deleted == true) return@map antigo
+
+                val remoto = dto.toEntity(pending = false, oldLocalPath = antigo?.fotoLocalPath)
+
+                // 2️⃣ se o local tem pendingSync, ele é mais novo → mantém local
+                if (antigo?.pendingSync == true) return@map antigo
+
+                // 3️⃣ se o local tem updatedAt mais recente, mantém local
+                if (antigo != null && antigo.updatedAt > remoto.updatedAt) return@map antigo
+
+                // 4️⃣ caso contrário, aceita o remoto (API)
+                remoto
             }
 
             dao.upsertAll(remotos)
 
             val idsRemotos = remotos.map { it.id }.toSet()
             val locais = dao.getAll()
-            val paraRemover =
-                locais.filter { it.id !in idsRemotos && !it.pendingSync && !it.localOnly }
-
-            paraRemover.forEach { dao.deleteById(it.id) }
+            locais.filter { local ->
+                local.id !in idsRemotos && !local.pendingSync && !local.localOnly
+            }.forEach { dao.deleteById(it.id) }
 
         } catch (e: Exception) {
-            android.util.Log.w(
-                "UsuarioRepository",
-                "Sem conexão — não foi possível atualizar da API (${e.message})"
-            )
+            android.util.Log.w("UsuarioRepository", "Sem conexão no pull: ${e.message}")
         }
     }
-
 
     @Suppress("unused")
     suspend fun syncAll(): Result<Unit> = runCatching {
@@ -304,7 +294,6 @@ class UsuarioRepository @Inject constructor(
             } catch (_: Exception) {
             }
         }
-
         refresh()
     }
 

@@ -6,10 +6,11 @@ import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface UsuarioDao {
-    @Query("SELECT * FROM usuarios ORDER BY updatedAt DESC")
+
+    @Query("SELECT * FROM usuarios WHERE deleted = 0 ORDER BY updatedAt DESC")
     fun observeAll(): Flow<List<UsuarioEntity>>
 
-    @Query("SELECT * FROM usuarios WHERE id = :id")
+    @Query("SELECT * FROM usuarios WHERE id = :id AND deleted = 0")
     fun observeById(id: String): Flow<UsuarioEntity?>
 
     @Query("SELECT * FROM usuarios WHERE id = :id")
